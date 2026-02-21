@@ -1,0 +1,3 @@
+# Place sophia_weights.bin here before building.
+# The weights file is not tracked in git (too large, model-specific).
+# Generate it with the training pipeline or obtain from Elyan Labs.

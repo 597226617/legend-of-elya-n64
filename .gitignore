@@ -1,0 +1,7 @@
+build/
+*.z64
+*.o
+*.d
+*.elf
+*.dfs
+filesystem/sophia_weights.bin
