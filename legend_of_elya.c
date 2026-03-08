@@ -58,6 +58,14 @@ typedef struct {
     int attack_target;      // 0 = stalfos, 1 = keese
     int hearts;             // half-heart count: 8 = 4 full hearts, 0 = dead
     int magic;              // magic bar 0-128 (128 = full)
+    // Performance monitoring
+    uint32_t perf_frame_start;   // CP0 COUNT at frame start
+    uint32_t perf_gen_cycles;    // cycles spent in sgai_next_token this frame
+    uint32_t perf_gen_total_us;  // total generation time in microseconds
+    uint32_t perf_gen_start_us;  // timestamp when generation started
+    float    perf_cpu_pct;       // CPU% used by inference (0-100)
+    float    perf_toks_precise;  // precise tok/s using cycle counter
+    int      perf_show;          // 1 = show performance overlay
 } GameCtx;
 
 static GameCtx G;
@@ -68,6 +76,14 @@ static GameCtx G;
  * deterministically, so we rely on prompt_idx advancing each A-press
  * to guarantee a different topic every conversation.
  * On real hardware, TICKS jitter adds extra unpredictability. */
+/* N64 R4300i runs at 93.75 MHz. CP0 COUNT increments every other cycle = 46.875 MHz.
+ * So 1 microsecond = ~46.875 counts.  We use TICKS_READ() which reads CP0 COUNT. */
+#define CYCLES_TO_US(c)   ((uint32_t)(c) / 47)
+#define US_TO_CYCLES(us)  ((uint32_t)(us) * 47)
+
+/* One NTSC frame = 1/60s = 16667us = ~781,250 CP0 counts */
+#define FRAME_CYCLES  781250
+
 #define N64_ENTROPY() ((uint32_t)(TICKS_READ())                    \
                        ^ ((uint32_t)G.frame << 3)                  \
                        ^ ((uint32_t)G.gen_last_tok * 2654435761u)  \
@@ -595,6 +611,65 @@ static void scene_dungeon(void) {
         fillrect(bx+67, by,     1,  6, RGBA32( 80, 180,  80, 255)); // right border
     }
 
+    // Performance bars (RDP-drawn during generation)
+    if (G.perf_show && (G.state == STATE_GENERATING || G.state == STATE_DIALOG)) {
+        int bar_y = 140;
+
+        // CPU bar background
+        fillrect(28, bar_y, 84, 6, RGBA32(20, 20, 20, 255));
+        // CPU bar fill (red→orange gradient based on load)
+        {
+            int cpu_fill = (int)(G.perf_cpu_pct * 0.80f);
+            if (cpu_fill > 80) cpu_fill = 80;
+            if (cpu_fill < 1) cpu_fill = 1;
+            if (G.perf_cpu_pct > 80.0f) {
+                fillrect(30, bar_y+1, cpu_fill, 4, RGBA32(255, 60, 30, 255));  // red = heavy
+            } else if (G.perf_cpu_pct > 40.0f) {
+                fillrect(30, bar_y+1, cpu_fill, 4, RGBA32(255, 160, 30, 255)); // orange
+            } else {
+                fillrect(30, bar_y+1, cpu_fill, 4, RGBA32(80, 220, 80, 255));  // green = light
+            }
+        }
+        // CPU bar border
+        fillrect(28, bar_y,   84, 1, RGBA32(100, 100, 100, 255));
+        fillrect(28, bar_y+5, 84, 1, RGBA32(100, 100, 100, 255));
+        fillrect(28, bar_y,    1, 6, RGBA32(100, 100, 100, 255));
+        fillrect(111, bar_y,   1, 6, RGBA32(100, 100, 100, 255));
+
+#ifdef USE_RSP_MATMUL
+        // RSP bar (always shows "active" during generation since RSP does matmul)
+        fillrect(130, bar_y, 84, 6, RGBA32(20, 20, 20, 255));
+        if (G.state == STATE_GENERATING) {
+            fillrect(132, bar_y+1, 60, 4, RGBA32(30, 200, 255, 255));  // cyan = RSP active
+        }
+        fillrect(130, bar_y,   84, 1, RGBA32(100, 100, 100, 255));
+        fillrect(130, bar_y+5, 84, 1, RGBA32(100, 100, 100, 255));
+        fillrect(130, bar_y,    1, 6, RGBA32(100, 100, 100, 255));
+        fillrect(213, bar_y,   1, 6, RGBA32(100, 100, 100, 255));
+#endif
+
+        // Tok/s numeric right-aligned
+        {
+            int whole = (int)G.perf_toks_precise;
+            int frac  = (int)((G.perf_toks_precise - (float)whole) * 10.0f);
+            if (whole > 99) { whole = 99; frac = 9; }
+            char tsbuf[12];
+            int i = 0;
+            if (whole >= 10) tsbuf[i++] = '0' + whole / 10;
+            tsbuf[i++] = '0' + whole % 10;
+            tsbuf[i++] = '.';
+            tsbuf[i++] = '0' + frac;
+            tsbuf[i++] = ' ';
+            tsbuf[i++] = 't';
+            tsbuf[i++] = 'o';
+            tsbuf[i++] = 'k';
+            tsbuf[i++] = '/';
+            tsbuf[i++] = 's';
+            tsbuf[i] = '\0';
+            // Will be drawn with graphics_draw_text in SW pass
+        }
+    }
+
     // Floor line
     fillrect(0, 148, 320, 2, RGBA32(40,30,60,255));
 }
@@ -647,21 +722,53 @@ static void draw_text(surface_t *disp) {
     case STATE_GENERATING: {
         graphics_draw_text(disp, 16, 158, "Sophia Elya:");
 
-        // Tok/s indicator during live generation
+        // Performance overlay during generation
         if (G.state == STATE_GENERATING && G.gen_out_count > 0) {
-            char spdbuf[10];
-            int whole = (int)G.gen_toks_sec;
-            int frac  = (int)((G.gen_toks_sec - (float)whole) * 10.0f);
+            // Tok/s (precise)
+            char spdbuf[16];
+            int whole = (int)G.perf_toks_precise;
+            int frac  = (int)((G.perf_toks_precise - (float)whole) * 10.0f);
             if (whole > 99) whole = 99;
             spdbuf[0] = (whole >= 10) ? ('0' + whole / 10) : ' ';
             spdbuf[1] = '0' + (whole % 10);
             spdbuf[2] = '.';
             spdbuf[3] = '0' + frac;
-            spdbuf[4] = 't';
-            spdbuf[5] = '/';
-            spdbuf[6] = 's';
-            spdbuf[7] = '\0';
-            graphics_draw_text(disp, 212, 158, spdbuf);
+            spdbuf[4] = ' ';
+            spdbuf[5] = 't';
+            spdbuf[6] = '/';
+            spdbuf[7] = 's';
+            spdbuf[8] = '\0';
+            graphics_draw_text(disp, 200, 158, spdbuf);
+
+            // Total gen time in ms
+            {
+                int ms = (int)(G.perf_gen_total_us / 1000);
+                char tbuf[12];
+                int ti = 0;
+                if (ms >= 1000) { tbuf[ti++] = '0' + (ms / 1000) % 10; ms %= 1000; }
+                if (ms >= 100 || ti > 0) tbuf[ti++] = '0' + (ms / 100) % 10;
+                tbuf[ti++] = '0' + (ms / 10) % 10;
+                tbuf[ti++] = '0' + ms % 10;
+                tbuf[ti++] = 'm'; tbuf[ti++] = 's'; tbuf[ti] = '\0';
+                graphics_draw_text(disp, 260, 158, tbuf);
+            }
+        }
+
+        // Performance bars (show during and briefly after generation)
+        if (G.perf_show && (G.state == STATE_GENERATING || G.perf_cpu_pct > 0.0f)) {
+            int bar_y = 145;  // just above dialog box
+
+            // CPU inference bar (red/orange)
+            {
+                int cpu_fill = (int)(G.perf_cpu_pct * 0.80f);  // 80px max
+                if (cpu_fill > 80) cpu_fill = 80;
+                if (cpu_fill < 0) cpu_fill = 0;
+                graphics_draw_text(disp, 4, bar_y - 1, "CPU");
+            }
+#ifdef USE_RSP_MATMUL
+            // RSP indicator (cyan)
+            graphics_draw_text(disp, 44, bar_y - 1, "RSP");
+#endif
         }
 
         // Character reveal with word-wrap
@@ -710,8 +817,12 @@ static void update_generating_step(void) {
 
     if (G.gen_ppos < G.gen_plen) {
         // Phase 0: feed prompt tokens (discard output; temperature=0)
-        G.gen_last_tok = sgai_next_token(&G.ai,
-                                          G.gen_pbuf[G.gen_ppos], 0);
+        {
+            uint32_t _t0 = TICKS_READ();
+            G.gen_last_tok = sgai_next_token(&G.ai,
+                                              G.gen_pbuf[G.gen_ppos], 0);
+            G.perf_gen_cycles += TICKS_READ() - _t0;
+        }
         G.gen_ppos++;
         if (G.gen_ppos >= G.gen_plen) {
             // Prompt fully fed — gen_last_tok now holds the model's prediction
@@ -723,7 +834,9 @@ static void update_generating_step(void) {
     } else {
         // Phase 1: generate one output token
         // temp_q8=64 → T=0.25 (mild randomness — varied but coherent outputs for demo)
+        uint32_t _t0 = TICKS_READ();
         uint8_t tok = sgai_next_token(&G.ai, G.gen_last_tok, 64);
+        G.perf_gen_cycles += TICKS_READ() - _t0;
         G.gen_last_tok = tok;
         G.gen_out_count++;
 
@@ -742,10 +855,25 @@ static void update_generating_step(void) {
             G.dialog_char = G.dialog_len;   // show immediately
         }
 
-        // Update tok/s
-        int elapsed = G.frame - G.gen_start_frame;
-        if (elapsed > 0)
-            G.gen_toks_sec = (float)G.gen_out_count * 60.0f / (float)elapsed;
+        // Update tok/s — precise using CP0 cycle counter
+        {
+            uint32_t now_us = CYCLES_TO_US(TICKS_READ());
+            uint32_t elapsed_us = now_us - G.perf_gen_start_us;
+            if (elapsed_us > 1000) {  // at least 1ms elapsed
+                G.perf_toks_precise = (float)G.gen_out_count * 1000000.0f / (float)elapsed_us;
+                G.gen_toks_sec = G.perf_toks_precise;
+                G.perf_gen_total_us = elapsed_us;
+            }
+            // CPU% = inference cycles / frame cycles
+            // Average over frames since gen started
+            int frames_elapsed = G.frame - G.gen_start_frame;
+            if (frames_elapsed > 0) {
+                uint32_t total_frame_cycles = (uint32_t)frames_elapsed * FRAME_CYCLES;
+                // perf_gen_cycles accumulates across all frames
+                G.perf_cpu_pct = (float)G.perf_gen_cycles * 100.0f / (float)total_frame_cycles;
+                if (G.perf_cpu_pct > 100.0f) G.perf_cpu_pct = 100.0f;
+            }
+        }
 
         // Stop when null/newline token, max output, or buffer full
         if (tok == 0 || G.dialog_len >= 80) {
@@ -766,6 +894,12 @@ static void start_dialog(void) {
     G.gen_out_count   = 0;
     G.gen_start_frame = G.frame;
     G.gen_toks_sec    = 0.0f;
+    G.perf_gen_cycles   = 0;
+    G.perf_gen_total_us = 0;
+    G.perf_gen_start_us = CYCLES_TO_US(TICKS_READ());
+    G.perf_cpu_pct      = 0.0f;
+    G.perf_toks_precise = 0.0f;
+    G.perf_show         = 1;
     memset(G.dialog_buf, 0, sizeof(G.dialog_buf));
 
     /* Hardware entropy seed selection — RIP-PoA oscillator trick:
@@ -886,6 +1020,7 @@ int main(void) {
         surface_t *disp = display_get();
 
         // ── RDP graphics pass ──────────────────────────────────────────────
+        G.perf_frame_start = TICKS_READ();
         rdpq_attach(disp, NULL);
 
         if (G.state == STATE_ANNIVERSARY) {
