@@ -179,7 +179,129 @@ static void embed_lookup(const SGAIHeader *hdr, float em_scale,
 }
 
 /* -----------------------------------------------------------------------
+ * PSE: Physarum Slime Mold Attention Router
+ *
+ * Maintains per-head "tube conductance" that evolves across tokens.
+ * Heads that produce sharp attention grow; flat heads wither.
+ * On entropy spike (topic change), conductances reset to explore.
+ *
+ * Inspired by Physarum polycephalum network optimization.
+ * Equivalent to POWER8 PSE vec_perm collapse, adapted for MIPS.
+ * ----------------------------------------------------------------------- */
+
+#define PSE_PHYSARUM_REINFORCE  0.1f   /* Conductance growth rate (gentle) */
+#define PSE_PHYSARUM_DECAY      0.02f  /* Conductance decay rate (slow) */
+#define PSE_PHYSARUM_MIN        0.5f   /* Never drop below half — tiny model needs all heads */
+#define PSE_PHYSARUM_MAX        1.5f   /* Mild amplification cap */
+#define PSE_PHYSARUM_PRUNE      0.0f   /* DISABLED — don't skip heads on 4-head model */
+#define PSE_BURST_INTERVAL      8      /* Entropy every 8th token (gentler) */
+#define PSE_BURST_STRENGTH      0.02f  /* 2% — subtle seasoning, not a firehose */
+#define PSE_BURST_DIMS          8      /* Only 8 of 128 dims */
+
+static struct {
+    float conductance[SGAI_N_LAYERS][SGAI_N_HEADS];
+    float entropy_ema;
+    uint32_t token_counter;
+} pse_state;
+
+static void pse_init(void)
+{
+    for (int l = 0; l < SGAI_N_LAYERS; l++)
+        for (int h = 0; h < SGAI_N_HEADS; h++)
+            pse_state.conductance[l][h] = 1.0f;
+    pse_state.entropy_ema = 0.0f;
+    pse_state.token_counter = 0;
+}
+
+/* Read CP0 COUNT with xorshift mixing — N64's equivalent of POWER8 mftb */
+static inline uint32_t pse_entropy(void)
+{
+    uint32_t c;
+    asm volatile("mfc0 %0, $9" : "=r"(c));
+    c ^= c << 13;
+    c ^= c >> 17;
+    c ^= c << 5;
+    return c;
+}
+
+/* Burst entropy injection into activation vector (before logit projection) */
+static void pse_burst_inject(float *x, int n_embed)
+{
+    pse_state.token_counter++;
+    if ((pse_state.token_counter % PSE_BURST_INTERVAL) != 0)
+        return;
+
+    uint32_t ent = pse_entropy();
+
+    /* Compute activation RMS for scaling */
+    float sum_sq = 0.0f;
+    for (int i = 0; i < n_embed; i++)
+        sum_sq += x[i] * x[i];
+
+    /* Fast inverse sqrt (Quake III trick) */
+    union { float f; uint32_t i; } u;
+    u.f = sum_sq / (float)n_embed + 1e-8f;
+    u.i = 0x5f3759df - (u.i >> 1);
+    float inv_rms = u.f;
+    inv_rms = inv_rms * (1.5f - 0.5f * (sum_sq / (float)n_embed) * inv_rms * inv_rms);
+    float rms = 1.0f / (inv_rms + 1e-8f);
+
+    float strength = rms * PSE_BURST_STRENGTH;
+    for (int i = 0; i < PSE_BURST_DIMS; i++) {
+        int dim = (ent >> (i & 15)) & 0x7F;
+        if (dim >= n_embed) dim = dim % n_embed;
+        float noise = ((ent >> (i + 16)) & 1) ? strength : -strength;
+        x[dim] += noise;
+        ent = ent * 1664525u + 1013904223u;  /* LCG step */
+    }
+}
+
+/* Update Physarum conductances after one attention layer */
+static void pse_physarum_update(int layer_idx, const float *sharpness)
+{
+    float max_sharp = 0.0f;
+    for (int h = 0; h < SGAI_N_HEADS; h++)
+        if (sharpness[h] > max_sharp) max_sharp = sharpness[h];
+    if (max_sharp < 1e-6f) return;
+
+    for (int h = 0; h < SGAI_N_HEADS; h++) {
+        float norm = sharpness[h] / max_sharp;
+        float *cond = &pse_state.conductance[layer_idx][h];
+        if (norm > 0.5f)
+            *cond += PSE_PHYSARUM_REINFORCE * (norm - 0.5f);
+        else
+            *cond -= PSE_PHYSARUM_DECAY * (0.5f - norm);
+        if (*cond < PSE_PHYSARUM_MIN) *cond = PSE_PHYSARUM_MIN;
+        if (*cond > PSE_PHYSARUM_MAX) *cond = PSE_PHYSARUM_MAX;
+    }
+}
+
+/* Check for entropy spike = topic change → reset to exploration */
+static void pse_physarum_check_reset(const float *logits)
+{
+    /* Count active candidates as entropy proxy */
+    float mx = logits[32];
+    for (int i = 33; i <= 126; i++)
+        if (logits[i] > mx) mx = logits[i];
+    float count = 0.0f;
+    for (int i = 32; i <= 126; i++)
+        if (logits[i] > mx - 10.0f) count += 1.0f;
+    float ent = count / 95.0f;
+
+    float delta = ent - pse_state.entropy_ema;
+    pse_state.entropy_ema = pse_state.entropy_ema * 0.9f + ent * 0.1f;
+
+    if (delta > 0.5f) {
+        /* Topic change — reset all tubes to exploration */
+        for (int l = 0; l < SGAI_N_LAYERS; l++)
+            for (int h = 0; h < SGAI_N_HEADS; h++)
+                pse_state.conductance[l][h] = 1.0f;
+    }
+}
+
+/* -----------------------------------------------------------------------
  * Attention + FFN layer forward pass (float32)
+ * With PSE: Physarum head routing + sparse FFN + weight skip
  * ----------------------------------------------------------------------- */
 static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
                             int layer_idx, int pos, float *x)
@@ -191,6 +313,7 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
     static float ff_buf[SGAI_N_EMBED * 4];
     static float attn_scores[SGAI_CTX];
     static float residual[SGAI_N_EMBED];
+    float head_sharpness[SGAI_N_HEADS];
 
     /* Save residual */
     memcpy(residual, x, SGAI_N_EMBED * sizeof(float));
@@ -209,36 +332,52 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
         memcpy(kv->v[layer_idx][pos], v_cur, SGAI_N_EMBED * sizeof(float));
     }
 
-    /* Multi-head attention */
+    /* Multi-head attention with PSE Physarum routing */
     memset(attn_out, 0, SGAI_N_EMBED * sizeof(float));
     int n_ctx = (pos + 1 < SGAI_CTX) ? pos + 1 : SGAI_CTX;
-
-    /* 1/sqrt(head_dim) = 1/sqrt(32) ≈ 0.17678 */
     float inv_sqrt_hd = 0.17678f;
 
     for (int h = 0; h < SGAI_N_HEADS; h++) {
+        float cond = pse_state.conductance[layer_idx][h];
+
+        /* PSE: Physarum prune — skip retracted tubes entirely */
+        if (cond < PSE_PHYSARUM_PRUNE) {
+            head_sharpness[h] = 0.0f;
+            continue;  /* Saves softmax + V-weighted-sum for this head */
+        }
+
         const float *q_head = q + h * SGAI_HEAD_DIM;
 
-        /* Attention scores */
+        /* Attention scores + measure sharpness */
+        float max_score = -1e9f;
+        float sum_score = 0.0f;
+
         for (int t = 0; t < n_ctx; t++) {
             const float *k_head = kv->k[layer_idx][t] + h * SGAI_HEAD_DIM;
             float score = 0.0f;
             for (int d = 0; d < SGAI_HEAD_DIM; d++)
                 score += q_head[d] * k_head[d];
             attn_scores[t] = score * inv_sqrt_hd;
+            if (attn_scores[t] > max_score) max_score = attn_scores[t];
+            sum_score += attn_scores[t];
         }
+
+        head_sharpness[h] = max_score - (sum_score / (float)n_ctx);
 
         /* Softmax */
         softmax_f(attn_scores, n_ctx);
 
-        /* Weighted sum of V */
+        /* V-weighted-sum scaled by Physarum tube conductance */
         for (int d = 0; d < SGAI_HEAD_DIM; d++) {
             float acc = 0.0f;
             for (int t = 0; t < n_ctx; t++)
                 acc += attn_scores[t] * kv->v[layer_idx][t][h * SGAI_HEAD_DIM + d];
-            attn_out[h * SGAI_HEAD_DIM + d] = acc;
+            attn_out[h * SGAI_HEAD_DIM + d] = acc * cond;  /* Hebbian amplify */
         }
     }
+
+    /* Update Physarum conductances */
+    pse_physarum_update(layer_idx, head_sharpness);
 
     /* Output projection */
     static float proj_out[SGAI_N_EMBED];
@@ -257,7 +396,7 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
     for (int i = 0; i < SGAI_N_EMBED * 4; i++)
         if (ff_buf[i] < 0.0f) ff_buf[i] = 0.0f;
 
-    /* ff2: 512 -> 128 */
+    /* ff2: 512 -> 128 (dense — sparse column-wise was slower due to cache thrash) */
     static float ff_out[SGAI_N_EMBED];
     matmul_q8(layer->wff2, layer->sff2, ff_buf, ff_out, SGAI_N_EMBED * 4, SGAI_N_EMBED);
 
@@ -387,6 +526,9 @@ void sgai_init(SGAIState *state, const void *rom_weights)
     }
     state->seq_len = 0;
 
+    /* PSE: Initialize Physarum slime mold attention router */
+    pse_init();
+
 #ifdef USE_RSP_MATMUL
     /* Initialize RSP matmul subsystem */
     if (rsp_matmul_init()) {
@@ -408,6 +550,9 @@ void sgai_reset(SGAIState *state)
     memset(state->logits, 0, sizeof(state->logits));
     memset(state->penalty_hist, 0, sizeof(state->penalty_hist));
     state->penalty_n = 0;
+
+    /* PSE: Reset Physarum to exploration mode for new conversation */
+    pse_init();
 }
 
 uint8_t sgai_next_token(SGAIState *state, uint8_t input_token,
@@ -432,8 +577,14 @@ uint8_t sgai_next_token(SGAIState *state, uint8_t input_token,
     /* 3. Final layer norm */
     rms_norm(state->x, SGAI_N_EMBED);
 
+    /* PSE: Burst entropy injection (N64 CP0 COUNT = POWER8 mftb equivalent) */
+    pse_burst_inject(state->x, SGAI_N_EMBED);
+
     /* 4. Project to logits */
     project_to_logits(state->weights, state->em_scale, state->x, state->logits);
+
+    /* PSE: Check for topic change → Physarum exploration reset */
+    pse_physarum_check_reset(state->logits);
 
     /* 5. Sample */
     uint8_t next_tok = sample_logits(state->logits, temperature_q8,

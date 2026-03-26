@@ -22,15 +22,136 @@
 #include "n64_llm_rpc.h"
 #endif
 
+// ─── Room & NPC System ───────────────────────────────────────────────────────
+
+typedef enum {
+    ROOM_DUNGEON = 0,    // Original dungeon — Sophia Elya
+    ROOM_LIBRARY,        // Eastern library — The Librarian
+    ROOM_FORGE,          // Western forge — Grumpy Blacksmith
+    ROOM_COUNT
+} RoomID;
+
+// Room exit edges — which direction leads where
+typedef struct {
+    int8_t north;   // room ID or -1
+    int8_t south;
+    int8_t east;
+    int8_t west;
+} RoomExits;
+
+static const RoomExits ROOM_MAP[ROOM_COUNT] = {
+    [ROOM_DUNGEON] = { -1,         -1,  ROOM_LIBRARY,  ROOM_FORGE },
+    [ROOM_LIBRARY] = { -1,         -1, -1,             ROOM_DUNGEON },
+    [ROOM_FORGE]   = { -1,         -1,  ROOM_DUNGEON, -1 },
+};
+
+static const char *ROOM_NAMES[ROOM_COUNT] = {
+    "Crystal Dungeon",
+    "Arcane Library",
+    "Ember Forge",
+};
+
+// NPC profile — persona injected before player prompt to steer model output
+typedef struct {
+    const char *name;           // display name
+    const char *persona_prefix; // prepended to prompt (max ~16 chars to fit CTX)
+    int         sprite_x;       // x position in room
+    int         sprite_y_base;  // base y (before bob)
+    uint8_t     color_r, color_g, color_b;  // primary palette
+    uint8_t     dress_r, dress_g, dress_b;  // dress/outfit color
+    RoomID      room;           // which room this NPC lives in
+} NPCProfile;
+
+#define NPC_COUNT 3
+static const NPCProfile NPC_PROFILES[NPC_COUNT] = {
+    { // Sophia Elya — guide of the realm (original NPC)
+        "Sophia Elya", "sage says: ",
+        204, 72,
+        80, 50, 120,   // purple torso
+        60, 30, 100,   // purple dress
+        ROOM_DUNGEON
+    },
+    { // Aldric — mysterious librarian
+        "Aldric the Keeper", "scholar says: ",
+        210, 76,
+        40, 60, 100,   // dark blue torso
+        30, 40,  80,   // dark blue robe
+        ROOM_LIBRARY
+    },
+    { // Brunhild — grumpy blacksmith
+        "Brunhild", "smith says: ",
+        190, 74,
+        120, 80, 40,   // brown torso
+        100, 60, 20,   // brown apron
+        ROOM_FORGE
+    },
+};
+
+// Contextual dialog options per NPC (D-pad selectable)
+#define DIALOG_OPTIONS 4
+static const char *NPC_DIALOG_OPTIONS[NPC_COUNT][DIALOG_OPTIONS] = {
+    { // Sophia
+        "Who are you?: ",
+        "What lurks here?: ",
+        "Tell me a secret.: ",
+        "What is RustChain?: ",
+    },
+    { // Aldric
+        "What is your name?: ",
+        "What is proof of antiquity?: ",
+        "What is MIPS?: ",
+        "How big is your model?: ",
+    },
+    { // Brunhild
+        "What do I need here?: ",
+        "What is the G4?: ",
+        "What is AltiVec?: ",
+        "What is vec_perm?: ",
+    },
+};
+
+// Canned fallback responses per NPC (when weights not loaded)
+static const char *NPC_CANNED[NPC_COUNT][DIALOG_OPTIONS] = {
+    { // Sophia
+        "I am Sophia Elya, guide of the realm.",
+        "Skeletons and bats haunt these halls.",
+        "Seek the silver key behind the great statue.",
+        "RustChain proves old silicon still matters.",
+    },
+    { // Aldric
+        "I am Aldric, keeper of forbidden tomes.",
+        "Antiquity rewards those with vintage iron.",
+        "MIPS runs the VR4300 inside this cartridge.",
+        "An 819K transformer, fit in 8 megabytes.",
+    },
+    { // Brunhild
+        "A stronger blade. Now leave me be.",
+        "The G4 with AltiVec, two point five times.",
+        "AltiVec: vector power in old PowerPC.",
+        "Vec_perm shuffles 16 bytes in one cycle.",
+    },
+};
+
 // ─── Game State ───────────────────────────────────────────────────────────────
 
 typedef enum {
     STATE_ANNIVERSARY,   // Legend of Elya splash screen
     STATE_TITLE,
     STATE_DUNGEON,
+    STATE_DIALOG_SELECT, // D-pad to pick dialog option
     STATE_DIALOG,
     STATE_GENERATING,
+    STATE_KEYBOARD,      // Virtual keyboard for player text input
+    STATE_ROOM_TRANSITION, // brief fade between rooms
 } GameState;
+
+// Forge spark particle (static pool, no alloc)
+#define MAX_SPARKS 12
+typedef struct {
+    int16_t x, y;
+    int8_t  dx, dy;
+    uint8_t life;    // frames remaining
+} Spark;
 
 typedef struct {
     GameState state;
@@ -40,6 +161,17 @@ typedef struct {
     int dialog_len;
     int frame;
     uint32_t anniversary_cp0;  // CP0 Count at boot for real-time splash duration
+    // Room system
+    RoomID   current_room;
+    int      transition_timer;  // frames remaining in room transition fade
+    RoomID   transition_target; // room we're transitioning to
+    int      dialog_select_idx; // currently highlighted dialog option (0-3)
+    int      current_npc;       // NPC index in current room (-1 if none)
+    // Player position (for room edge detection)
+    int      player_x;
+    int      player_y;
+    // Forge sparks
+    Spark    sparks[MAX_SPARKS];
     // AI
     SGAIState ai;
     SGAIKVCache kv;
@@ -70,6 +202,12 @@ typedef struct {
     float    perf_cpu_pct;       // CPU% used by inference (0-100)
     float    perf_toks_precise;  // precise tok/s using cycle counter
     int      perf_show;          // 1 = show performance overlay
+    // Virtual keyboard
+    int      kb_row;             // cursor row (0-3)
+    int      kb_col;             // cursor column (0-9)
+    char     kb_input[64];       // player input buffer
+    int      kb_len;             // current input length
+    int      kb_debounce;        // frame counter for input debounce
 #ifdef USE_RPC_LLM
     int      rpc_active;         // 1 = bridge detected, using RPC
     int      rpc_pending;        // 1 = waiting for RPC response
@@ -78,6 +216,9 @@ typedef struct {
 } GameCtx;
 
 static GameCtx G;
+
+/* Forward declarations for cross-referenced functions */
+static void start_dialog_from_prompt(int npc_idx, const char *prompt, int use_persona);
 
 /* N64 hardware entropy — XOR CPU cycle counter low bits with frame,
  * last token, AND prompt_idx (sequential counter).
@@ -373,26 +514,94 @@ static void scene_anniversary(void) {
     fillrect(317, 0,   3, 240, RGBA32(215, 175, 0, 255));
 }
 
-// ─── Dungeon Scene ────────────────────────────────────────────────────────────
+// ─── Room Palette (per-room wall/floor/bg colors) ────────────────────────────
 
-static void scene_dungeon(void) {
-    int f = G.frame;
+typedef struct {
+    uint8_t bg_r, bg_g, bg_b;         // upper background
+    uint8_t wall_base;                  // base shade for wall bricks
+    int8_t  wall_r_off, wall_g_off, wall_b_off; // color tint offsets
+    uint8_t floor_base;                 // base shade for floor tiles
+    int8_t  floor_r_off, floor_g_off, floor_b_off;
+} RoomPalette;
 
-    // ── Keese position (hoisted — needed by attack overlay too) ───────────────
-    int kx = 150 + (int)(sinf(f * 0.045f) * 55.0f) + (int)(sinf(f * 0.13f) * 18.0f);
-    int ky =  38 + (int)(sinf(f * 0.031f) * 22.0f);
+static const RoomPalette ROOM_PALETTES[ROOM_COUNT] = {
+    [ROOM_DUNGEON] = { 8,4,16,   28, 0,-6,4,   18, 0,0,4 },     // original purple-gray
+    [ROOM_LIBRARY] = { 12,8,24,  24, -4,2,12,   22, -2,0,8 },    // deep blue stone
+    [ROOM_FORGE]   = { 16,6,4,   30, 8,-2,-4,   20, 6,-2,-4 },   // warm reddish stone
+};
 
-    // ── Attack auto-trigger (every ~3 seconds while in dungeon) ──────────────
-    if (G.state == STATE_DUNGEON && G.attack_timer <= 0
-            && f > 120 && (f % 180) == 0) {
-        G.attack_timer  = 42;
-        G.attack_target = (f / 180) & 1;  // alternate stalfos / keese
+// ─── Forge spark update ─────────────────────────────────────────────────────
+
+static void update_sparks(void) {
+    for (int i = 0; i < MAX_SPARKS; i++) {
+        Spark *s = &G.sparks[i];
+        if (s->life == 0) {
+            // Spawn new spark from anvil area (every ~8 frames per slot)
+            if ((G.frame + i * 7) % 10 == 0) {
+                s->x = 90 + (G.frame * 13 + i * 37) % 20 - 10;
+                s->y = 90;
+                s->dx = ((G.frame + i) % 5) - 2;
+                s->dy = -(2 + ((G.frame + i * 3) % 3));
+                s->life = 12 + (i % 8);
+            }
+            continue;
+        }
+        s->x += s->dx;
+        s->y += s->dy;
+        s->dy += 1;  // gravity
+        s->life--;
     }
-    int atk = G.attack_timer;
-    if (atk > 0) G.attack_timer--;
+}
 
-    // Sky/background
-    fillrect(0, 0, 320, 148, RGBA32(8, 4, 16, 255));
+static void draw_sparks(void) {
+    for (int i = 0; i < MAX_SPARKS; i++) {
+        Spark *s = &G.sparks[i];
+        if (s->life == 0) continue;
+        uint8_t bright = (s->life > 8) ? 255 : s->life * 30;
+        fillrect(s->x, s->y, 2, 2, RGBA32(255, bright, bright/3, 255));
+    }
+}
+
+// ─── Draw NPC sprite (generic, palette from NPCProfile) ─────────────────────
+
+static void draw_npc_sprite(const NPCProfile *npc, int f) {
+    int bob = (int)(sinf(f * 0.08f) * 2.0f);
+    int sx = npc->sprite_x, sy = npc->sprite_y_base + bob;
+
+    // Dress/robe
+    fillrect(sx-6, sy+14, 18, 28,
+             RGBA32(npc->dress_r, npc->dress_g, npc->dress_b, 255));
+    // Torso
+    fillrect(sx-4, sy+8, 14, 14,
+             RGBA32(npc->color_r, npc->color_g, npc->color_b, 255));
+    // Head (skin)
+    fillrect(sx-3, sy, 12, 12, RGBA32(220,180,140, 255));
+    // Hair — varies by NPC index for visual differentiation
+    if (npc->room == ROOM_DUNGEON) {
+        // Sophia: auburn hair
+        fillrect(sx-4, sy-2, 14, 5, RGBA32(80, 30, 10, 255));
+    } else if (npc->room == ROOM_LIBRARY) {
+        // Aldric: gray/silver hair
+        fillrect(sx-4, sy-2, 14, 5, RGBA32(140,140,150, 255));
+        // Beard
+        fillrect(sx-1, sy+9, 8, 5, RGBA32(140,140,150, 255));
+    } else {
+        // Brunhild: dark hair + headband
+        fillrect(sx-4, sy-2, 14, 5, RGBA32(40, 30, 20, 255));
+        fillrect(sx-5, sy+1, 16, 2, RGBA32(180, 50, 20, 255)); // red headband
+    }
+    // Eyes
+    fillrect(sx,   sy+3, 2, 2, RGBA32(20, 20, 80, 255));
+    fillrect(sx+5, sy+3, 2, 2, RGBA32(20, 20, 80, 255));
+}
+
+// ─── Room-specific scene elements ────────────────────────────────────────────
+
+static void draw_room_walls_floor(RoomID room) {
+    const RoomPalette *p = &ROOM_PALETTES[room];
+
+    // Upper background
+    fillrect(0, 0, 320, 148, RGBA32(p->bg_r, p->bg_g, p->bg_b, 255));
 
     // Stone wall rows
     for (int row = 0; row < 5; row++) {
@@ -401,183 +610,315 @@ static void scene_dungeon(void) {
             int bx = col * 32 + offset - 16;
             int by = row * 18;
             if (bx + 30 < 0 || bx > 320) continue;
-            int shade = 28 + ((col + row) % 3) * 7;
-            fillrect(bx+1, by+1, 30, 16, RGBA32(shade, shade-6, shade+4, 255));
+            int shade = p->wall_base + ((col + row) % 3) * 7;
+            int r = shade + p->wall_r_off; if (r < 0) r = 0; if (r > 255) r = 255;
+            int g = shade + p->wall_g_off; if (g < 0) g = 0; if (g > 255) g = 255;
+            int b = shade + p->wall_b_off; if (b < 0) b = 0; if (b > 255) b = 255;
+            fillrect(bx+1, by+1, 30, 16, RGBA32(r, g, b, 255));
         }
     }
 
     // Floor
     for (int row = 0; row < 5; row++) {
         for (int col = 0; col < 11; col++) {
-            int shade = 18 + ((col + row) & 1) * 7;
-            fillrect(col*32, 100 + row*10, 31, 9, RGBA32(shade,shade,shade+4,255));
+            int shade = p->floor_base + ((col + row) & 1) * 7;
+            int r = shade + p->floor_r_off; if (r < 0) r = 0;
+            int g = shade + p->floor_g_off; if (g < 0) g = 0;
+            int b = shade + p->floor_b_off; if (b < 0) b = 0;
+            fillrect(col*32, 100 + row*10, 31, 9, RGBA32(r, g, b, 255));
         }
     }
 
-    // Torch (flickering)
-    int flick = (f / 4) & 1;
-    fillrect(18, 56, 8+flick*2, 14, RGBA32(255, 140+flick*30, 0, 255));
-    fillrect(16, 66, 12+flick*2, 4, RGBA32(200, 60, 0, 255));
-    fillrect(22, 70, 2, 18, RGBA32(80, 60, 40, 255));
+    // Floor line
+    fillrect(0, 148, 320, 2, RGBA32(40,30,60,255));
+}
 
-    // Sophia Elya pixel sprite (right side)
-    int bob = (int)(sinf(f * 0.08f) * 2.0f);
-    int sx = 204, sy = 72 + bob;
-
-    // ── Shield (left arm, kite-style) ────────────────────────────────────
-    {
-        int shx = sx - 20, shy = sy + 6;
-        // Kite-shaped body (wider in middle, narrows to point)
-        fillrect(shx+1, shy,      10,  2, RGBA32(20,  50, 130, 255));
-        fillrect(shx,   shy+2,    12, 10, RGBA32(20,  50, 130, 255));
-        fillrect(shx+1, shy+12,   10,  4, RGBA32(20,  50, 130, 255));
-        fillrect(shx+2, shy+16,    8,  3, RGBA32(20,  50, 130, 255));
-        fillrect(shx+4, shy+19,    4,  4, RGBA32(20,  50, 130, 255));
-        // Gold trim border
-        fillrect(shx,   shy,      12,  2, RGBA32(215,175,  0, 255));
-        fillrect(shx,   shy+2,     2, 20, RGBA32(215,175,  0, 255));
-        fillrect(shx+10,shy+2,     2, 20, RGBA32(215,175,  0, 255));
-        // Elya gem emblem (mini crystal)
-        fillrect(shx+5, shy+4,     2,  2, RGBA32(80,220,255, 255));  // top
-        fillrect(shx+3, shy+6,     6,  3, RGBA32(40,160,200, 255));  // middle
-        fillrect(shx+5, shy+9,     2,  2, RGBA32(80,220,255, 255));  // bottom
-    }
-
-    // ── Sophia body ───────────────────────────────────────────────────────
-    fillrect(sx-6, sy+14, 18, 28, RGBA32(60, 30, 100, 255));  // dress
-    fillrect(sx-4, sy+8,  14, 14, RGBA32(80, 50, 120, 255));  // torso
-    fillrect(sx-3, sy,    12, 12, RGBA32(220,180,140, 255));   // head
-    fillrect(sx-4, sy-2,  14,  5, RGBA32(80, 30, 10, 255));   // hair
-    fillrect(sx,   sy+3,   2,  2, RGBA32(20, 20, 80, 255));   // left eye
-    fillrect(sx+5, sy+3,   2,  2, RGBA32(20, 20, 80, 255));   // right eye
-
-    // ── Sword (right arm, blade raised upward) ────────────────────────────
-    {
-        int swx = sx + 13;
-        // Blade (silver, drawn first so guard overlaps cleanly)
-        fillrect(swx,   sy-16,  2, 28, RGBA32(195,215,235, 255)); // main blade
-        fillrect(swx+1, sy-16,  1, 14, RGBA32(240,250,255, 255)); // edge highlight
-        // Blade tip
-        fillrect(swx,   sy-18,  2,  2, RGBA32(220,235,250, 255));
-        // Crossguard (gold)
-        fillrect(swx-5, sy+12,  12,  3, RGBA32(215,175,  0, 255));
-        fillrect(swx-5, sy+12,  12,  1, RGBA32(255,220, 60, 255)); // guard highlight
-        // Handle
-        fillrect(swx,   sy+15,   2,  7, RGBA32(110, 60, 15, 255));
-        // Pommel (gold ball)
-        fillrect(swx-1, sy+22,   4,  3, RGBA32(215,175,  0, 255));
-        // Animated gleam — travels up the blade every ~2 seconds
-        int gleam = (f / 7) % 22;
-        fillrect(swx, sy + 10 - gleam, 1, 4, RGBA32(255,255,255, 200));
-    }
-
-    // Stalfos skeleton (left side)
-    int ex = 80, ey = 78;
-    fillrect(ex-4, ey,     12, 10, RGBA32(220,220,200,255));
-    fillrect(ex-2, ey+2,    3,  3, RGBA32(8,4,16,255));
-    fillrect(ex+4, ey+2,    3,  3, RGBA32(8,4,16,255));
-    fillrect(ex-3, ey+10,  10,  4, RGBA32(200,200,180,255));
-    fillrect(ex-5, ey+14,  14, 16, RGBA32(180,180,160,255));
-    for (int r = 0; r < 3; r++)
-        fillrect(ex-5, ey+15+r*5, 14, 2, RGBA32(70,70,55,255));
-    fillrect(ex-4, ey+30,   4, 14, RGBA32(180,180,160,255));
-    fillrect(ex+4, ey+30,   4, 14, RGBA32(180,180,160,255));
-    // Hit flash: Stalfos (phase 2, atk 20→1, target=stalfos)
-    if (atk > 0 && atk <= 22 && G.attack_target == 0)
-        fillrect(ex-5, ey, 14, 44, RGBA32(255, 255, 255, 200));
-
-    // ── Keese (bat enemy) — animated wings, erratic flight path ────────────
-    // kx/ky hoisted to top of function for attack overlay use
-    int wing = (f / 5) & 1;   // wing flap: every 5 frames
-    // Dark body
-    fillrect(kx-3, ky-2, 6, 5, RGBA32(25, 15, 35, 255));
-    // Wings: alternate up-spread / down-spread
-    if (wing == 0) {
-        fillrect(kx-12, ky-5,  9, 6, RGBA32(50, 35, 70, 255));  // left wing up
-        fillrect(kx+3,  ky-5,  9, 6, RGBA32(50, 35, 70, 255));  // right wing up
-        fillrect(kx-12, ky-1,  4, 3, RGBA32(35, 22, 50, 255));  // left fold
-        fillrect(kx+8,  ky-1,  4, 3, RGBA32(35, 22, 50, 255));  // right fold
-    } else {
-        fillrect(kx-12, ky+1,  9, 5, RGBA32(50, 35, 70, 255));  // left wing down
-        fillrect(kx+3,  ky+1,  9, 5, RGBA32(50, 35, 70, 255));  // right wing down
-        fillrect(kx-10, ky-2,  4, 3, RGBA32(35, 22, 50, 255));  // left fold
-        fillrect(kx+6,  ky-2,  4, 3, RGBA32(35, 22, 50, 255));  // right fold
-    }
-    // Glowing red eyes
-    fillrect(kx-1, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
-    fillrect(kx+2, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
-    // Hit flash: Keese (phase 2 of attack, atk 20→1, target=keese)
-    if (atk > 0 && atk <= 22 && G.attack_target == 1)
-        fillrect(kx-12, ky-5, 25, 13, RGBA32(255, 255, 255, 200));
-
-    // ── Treasure Chest ─────────────────────────────────────────────────────
-    // Sits on the floor, center-right of dungeon
-    {
-        int cx = 146, cy = 112;
-        // Chest body (lower)
-        fillrect(cx,    cy+10, 28, 20, RGBA32(100, 62, 18, 255));
-        // Chest lid (upper, slightly lighter)
-        fillrect(cx,    cy,    28, 12, RGBA32(130, 82, 28, 255));
-        // Curved lid top highlight
-        fillrect(cx+2,  cy-1,  24,  2, RGBA32(155, 100, 40, 255));
-        // Gold trim — horizontal bands
-        fillrect(cx,    cy+10, 28,  2, RGBA32(215, 175,  0, 255));  // lid seam
-        fillrect(cx,    cy+28, 28,  2, RGBA32(215, 175,  0, 255));  // bottom
-        fillrect(cx,    cy,    28,  2, RGBA32(215, 175,  0, 255));  // top
-        // Gold trim — vertical sides
-        fillrect(cx,    cy,     2, 30, RGBA32(215, 175,  0, 255));  // left
-        fillrect(cx+26, cy,     2, 30, RGBA32(215, 175,  0, 255));  // right
-        // Center lock plate
-        fillrect(cx+11, cy+8,   6,  6, RGBA32(215, 175,  0, 255));
-        // Keyhole
-        fillrect(cx+13, cy+9,   2,  2, RGBA32(30,  20,   5, 255));
-        fillrect(cx+13, cy+11,  2,  3, RGBA32(30,  20,   5, 255));
-        // Shimmer glow on lid — pulses every ~30 frames
-        int glow = ((f / 30) & 1) ? 60 : 20;
-        fillrect(cx+3,  cy+3,   8,  2, RGBA32(255, 230, 100, glow));
-        fillrect(cx+14, cy+3,   8,  2, RGBA32(255, 230, 100, glow));
-    }
-
-    // ── Attack slash trail ──────────────────────────────────────────────────
-    if (atk > 22) {
-        // Swing phase (atk 42→23): slash arc from sword tip toward enemy
-        int prog = 42 - atk;         // 0 (start) → 19 (end of swing)
-        int swx_tip = sx + 14;       // sword tip x
-        int swy_tip = sy - 14;       // sword tip y
-        int tx = (G.attack_target == 0) ? ex + 1 : kx;
-        int ty = (G.attack_target == 0) ? ey + 4 : ky;
-        // Interpolate: tip → enemy, progress 0-19 out of 19 steps
-        int lx = swx_tip + ((tx - swx_tip) * prog) / 19;
-        int ly = swy_tip + ((ty - swy_tip) * prog) / 19;
-        // Bright spark at leading edge
-        fillrect(lx-2, ly-2, 6, 6, RGBA32(255, 255, 120, 255));
-        fillrect(lx-1, ly-1, 4, 4, RGBA32(255, 240, 60,  255));
-        // Short trail 3 steps behind
-        if (prog > 2) {
-            int lx2 = swx_tip + ((tx - swx_tip) * (prog - 3)) / 19;
-            int ly2 = swy_tip + ((ty - swy_tip) * (prog - 3)) / 19;
-            fillrect(lx2-1, ly2-1, 4, 4, RGBA32(220, 200, 40, 180));
+// Library-specific props: bookshelves, reading desk, candles
+static void draw_library_props(int f) {
+    // Bookshelves on back wall (3 tall shelves)
+    for (int shelf = 0; shelf < 3; shelf++) {
+        int bx = 20 + shelf * 100;
+        // Shelf frame (dark wood)
+        fillrect(bx, 30, 60, 60, RGBA32(50, 30, 15, 255));
+        fillrect(bx+2, 32, 56, 2, RGBA32(70, 45, 20, 255));  // top
+        fillrect(bx+2, 52, 56, 2, RGBA32(70, 45, 20, 255));  // mid shelf
+        fillrect(bx+2, 72, 56, 2, RGBA32(70, 45, 20, 255));  // mid shelf 2
+        fillrect(bx+2, 88, 56, 2, RGBA32(70, 45, 20, 255));  // bottom
+        // Books (colored spines on each shelf)
+        for (int b = 0; b < 7; b++) {
+            int br = 60 + ((shelf*7+b) * 37) % 140;
+            int bg = 20 + ((shelf*7+b) * 53) % 80;
+            int bb = 30 + ((shelf*7+b) * 71) % 120;
+            fillrect(bx + 4 + b*8, 34, 6, 18, RGBA32(br, bg, bb, 255));
+            fillrect(bx + 4 + b*8, 54, 6, 18, RGBA32(bg, bb, br, 255));
+            fillrect(bx + 4 + b*8, 74, 6, 14, RGBA32(bb, br, bg, 255));
         }
-        if (prog > 5) {
-            int lx3 = swx_tip + ((tx - swx_tip) * (prog - 6)) / 19;
-            int ly3 = swy_tip + ((ty - swy_tip) * (prog - 6)) / 19;
-            fillrect(lx3,   ly3,   2, 2, RGBA32(180, 140, 20, 120));
-        }
-    } else if (atk > 0) {
-        // Impact spark phase (atk 22→1): radiating sparks at hit point
-        int hx2 = (G.attack_target == 0) ? ex + 1 : kx;
-        int hy2 = (G.attack_target == 0) ? ey + 4 : ky;
-        int sp  = 22 - atk;          // 0-21, grows outward
-        fillrect(hx2 + sp,     hy2 - sp/2, 3, 3, RGBA32(255, 230,   0, 255));
-        fillrect(hx2 - sp,     hy2 + sp/2, 3, 3, RGBA32(255, 200,  50, 255));
-        fillrect(hx2 + sp/2,   hy2 + sp,   3, 3, RGBA32(255, 160,   0, 255));
-        fillrect(hx2 - sp/2,   hy2 - sp,   3, 3, RGBA32(255, 100,   0, 255));
-        // Central bright star (fades after sp>8)
-        if (sp < 9)
-            fillrect(hx2 - 3, hy2 - 3, 7, 7, RGBA32(255, 255, 200, 255));
+    }
+    // Reading desk
+    fillrect(100, 108, 50, 8, RGBA32(80, 50, 20, 255));
+    fillrect(105, 116, 6, 20, RGBA32(60, 35, 15, 255));
+    fillrect(139, 116, 6, 20, RGBA32(60, 35, 15, 255));
+    // Open book on desk
+    fillrect(108, 104, 18, 6, RGBA32(220, 210, 180, 255));
+    fillrect(128, 104, 18, 6, RGBA32(230, 220, 190, 255));
+    // Candle on desk (flickering)
+    int flick = (f / 5) & 1;
+    fillrect(147, 96 - flick, 3 + flick, 6, RGBA32(255, 200 + flick*40, 80, 255));
+    fillrect(148, 102, 2, 6, RGBA32(200, 190, 170, 255));
+    // Ambient glow around candle
+    if ((f / 8) & 1)
+        fillrect(144, 92, 10, 8, RGBA32(255, 220, 100, 30));
+}
+
+// Forge-specific props: anvil, furnace, bellows
+static void draw_forge_props(int f) {
+    int flick = (f / 3) & 1;
+
+    // Large furnace (back wall, left)
+    fillrect(20, 30, 80, 60, RGBA32(50, 35, 30, 255));   // stone body
+    fillrect(24, 34, 72, 52, RGBA32(30, 20, 15, 255));    // inner
+    // Fire inside furnace
+    fillrect(30, 50, 60, 30, RGBA32(200+flick*40, 80+flick*30, 0, 255));
+    fillrect(35, 45, 50, 20, RGBA32(255, 160+flick*40, 20, 255));
+    fillrect(42, 40, 36, 12, RGBA32(255, 220, 80+flick*40, 255));
+    // Furnace opening (arch shape)
+    fillrect(38, 76, 44, 14, RGBA32(20, 12, 8, 255));
+    fillrect(40, 74, 40, 4, RGBA32(20, 12, 8, 255));
+
+    // Anvil (center floor)
+    fillrect(82, 104, 36, 6, RGBA32(100, 100, 110, 255));  // top
+    fillrect(86, 110, 28, 12, RGBA32(80, 80, 90, 255));     // body
+    fillrect(90, 122, 20, 14, RGBA32(70, 70, 80, 255));     // base
+    // Anvil horn (left point)
+    fillrect(74, 104, 10, 4, RGBA32(90, 90, 100, 255));
+    fillrect(72, 105, 4, 2, RGBA32(80, 80, 90, 255));
+    // Anvil highlight
+    fillrect(84, 104, 32, 1, RGBA32(150, 150, 160, 255));
+
+    // Weapon rack (right wall)
+    fillrect(240, 40, 4, 55, RGBA32(60, 40, 20, 255));
+    fillrect(270, 40, 4, 55, RGBA32(60, 40, 20, 255));
+    fillrect(238, 40, 38, 3, RGBA32(60, 40, 20, 255));
+    fillrect(238, 70, 38, 3, RGBA32(60, 40, 20, 255));
+    // Swords on rack
+    fillrect(250, 42, 2, 26, RGBA32(180, 195, 210, 255));
+    fillrect(260, 42, 2, 26, RGBA32(190, 200, 215, 255));
+    fillrect(250, 72, 2, 22, RGBA32(170, 185, 200, 255));
+
+    // Bellows (next to furnace)
+    fillrect(105, 68, 20, 16, RGBA32(90, 55, 25, 255));
+    int bellow_open = (f / 20) & 1;
+    fillrect(105, 64 - bellow_open * 3, 20, 6, RGBA32(70, 40, 15, 255));
+    fillrect(112, 84, 6, 8, RGBA32(60, 40, 20, 255));
+
+    // Ambient furnace glow on floor
+    if (flick)
+        fillrect(20, 90, 100, 10, RGBA32(80, 30, 0, 50));
+
+    // Draw sparks (particle effect from anvil)
+    draw_sparks();
+}
+
+// ─── Dungeon Scene (now room-aware) ──────────────────────────────────────────
+
+static void scene_dungeon(void) {
+    int f = G.frame;
+    RoomID room = G.current_room;
+
+    // Draw walls and floor with room palette
+    draw_room_walls_floor(room);
+
+    // Room-specific props
+    if (room == ROOM_LIBRARY) {
+        draw_library_props(f);
+    } else if (room == ROOM_FORGE) {
+        draw_forge_props(f);
     }
 
-    // ── HUD: 4 Hearts + Magic Bar (drawn last = on top) ─────────────────────
+    // ── Keese position (only in dungeon room) ────────────────────────────────
+    int kx = 0, ky = 0;
+    if (room == ROOM_DUNGEON) {
+        kx = 150 + (int)(sinf(f * 0.045f) * 55.0f) + (int)(sinf(f * 0.13f) * 18.0f);
+        ky =  38 + (int)(sinf(f * 0.031f) * 22.0f);
+    }
+
+    // ── Attack auto-trigger (only in dungeon) ────────────────────────────────
+    if (room == ROOM_DUNGEON && G.state == STATE_DUNGEON && G.attack_timer <= 0
+            && f > 120 && (f % 180) == 0) {
+        G.attack_timer  = 42;
+        G.attack_target = (f / 180) & 1;
+    }
+    int atk = G.attack_timer;
+    if (atk > 0) G.attack_timer--;
+
+    // Room-specific torches
+    if (room == ROOM_DUNGEON) {
+        int flick = (f / 4) & 1;
+        fillrect(18, 56, 8+flick*2, 14, RGBA32(255, 140+flick*30, 0, 255));
+        fillrect(16, 66, 12+flick*2, 4, RGBA32(200, 60, 0, 255));
+        fillrect(22, 70, 2, 18, RGBA32(80, 60, 40, 255));
+    }
+
+    // NPC sprite — find NPC for current room and draw
+    {
+        int npc_idx = -1;
+        for (int i = 0; i < NPC_COUNT; i++) {
+            if (NPC_PROFILES[i].room == room) { npc_idx = i; break; }
+        }
+        G.current_npc = npc_idx;
+        if (npc_idx >= 0) {
+            draw_npc_sprite(&NPC_PROFILES[npc_idx], f);
+        }
+    }
+
+    // Sophia-specific extras: shield + sword (only in dungeon)
+    if (room == ROOM_DUNGEON) {
+        int bob = (int)(sinf(f * 0.08f) * 2.0f);
+        int sx = 204, sy = 72 + bob;
+
+        // ── Shield (left arm, kite-style) ────────────────────────────────
+        {
+            int shx = sx - 20, shy = sy + 6;
+            fillrect(shx+1, shy,      10,  2, RGBA32(20,  50, 130, 255));
+            fillrect(shx,   shy+2,    12, 10, RGBA32(20,  50, 130, 255));
+            fillrect(shx+1, shy+12,   10,  4, RGBA32(20,  50, 130, 255));
+            fillrect(shx+2, shy+16,    8,  3, RGBA32(20,  50, 130, 255));
+            fillrect(shx+4, shy+19,    4,  4, RGBA32(20,  50, 130, 255));
+            fillrect(shx,   shy,      12,  2, RGBA32(215,175,  0, 255));
+            fillrect(shx,   shy+2,     2, 20, RGBA32(215,175,  0, 255));
+            fillrect(shx+10,shy+2,     2, 20, RGBA32(215,175,  0, 255));
+            fillrect(shx+5, shy+4,     2,  2, RGBA32(80,220,255, 255));
+            fillrect(shx+3, shy+6,     6,  3, RGBA32(40,160,200, 255));
+            fillrect(shx+5, shy+9,     2,  2, RGBA32(80,220,255, 255));
+        }
+
+        // ── Sword (right arm, blade raised upward) ───────────────────────
+        {
+            int swx = sx + 13;
+            fillrect(swx,   sy-16,  2, 28, RGBA32(195,215,235, 255));
+            fillrect(swx+1, sy-16,  1, 14, RGBA32(240,250,255, 255));
+            fillrect(swx,   sy-18,  2,  2, RGBA32(220,235,250, 255));
+            fillrect(swx-5, sy+12,  12,  3, RGBA32(215,175,  0, 255));
+            fillrect(swx-5, sy+12,  12,  1, RGBA32(255,220, 60, 255));
+            fillrect(swx,   sy+15,   2,  7, RGBA32(110, 60, 15, 255));
+            fillrect(swx-1, sy+22,   4,  3, RGBA32(215,175,  0, 255));
+            int gleam = (f / 7) % 22;
+            fillrect(swx, sy + 10 - gleam, 1, 4, RGBA32(255,255,255, 200));
+        }
+    }
+
+    // Dungeon-only enemies and combat
+    if (room == ROOM_DUNGEON) {
+        int sx = 204, sy = 72 + (int)(sinf(f * 0.08f) * 2.0f);
+
+        // Stalfos skeleton (left side)
+        int ex = 80, ey = 78;
+        fillrect(ex-4, ey,     12, 10, RGBA32(220,220,200,255));
+        fillrect(ex-2, ey+2,    3,  3, RGBA32(8,4,16,255));
+        fillrect(ex+4, ey+2,    3,  3, RGBA32(8,4,16,255));
+        fillrect(ex-3, ey+10,  10,  4, RGBA32(200,200,180,255));
+        fillrect(ex-5, ey+14,  14, 16, RGBA32(180,180,160,255));
+        for (int r = 0; r < 3; r++)
+            fillrect(ex-5, ey+15+r*5, 14, 2, RGBA32(70,70,55,255));
+        fillrect(ex-4, ey+30,   4, 14, RGBA32(180,180,160,255));
+        fillrect(ex+4, ey+30,   4, 14, RGBA32(180,180,160,255));
+        if (atk > 0 && atk <= 22 && G.attack_target == 0)
+            fillrect(ex-5, ey, 14, 44, RGBA32(255, 255, 255, 200));
+
+        // Keese (bat enemy)
+        int wing = (f / 5) & 1;
+        fillrect(kx-3, ky-2, 6, 5, RGBA32(25, 15, 35, 255));
+        if (wing == 0) {
+            fillrect(kx-12, ky-5,  9, 6, RGBA32(50, 35, 70, 255));
+            fillrect(kx+3,  ky-5,  9, 6, RGBA32(50, 35, 70, 255));
+            fillrect(kx-12, ky-1,  4, 3, RGBA32(35, 22, 50, 255));
+            fillrect(kx+8,  ky-1,  4, 3, RGBA32(35, 22, 50, 255));
+        } else {
+            fillrect(kx-12, ky+1,  9, 5, RGBA32(50, 35, 70, 255));
+            fillrect(kx+3,  ky+1,  9, 5, RGBA32(50, 35, 70, 255));
+            fillrect(kx-10, ky-2,  4, 3, RGBA32(35, 22, 50, 255));
+            fillrect(kx+6,  ky-2,  4, 3, RGBA32(35, 22, 50, 255));
+        }
+        fillrect(kx-1, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
+        fillrect(kx+2, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
+        if (atk > 0 && atk <= 22 && G.attack_target == 1)
+            fillrect(kx-12, ky-5, 25, 13, RGBA32(255, 255, 255, 200));
+
+        // Treasure Chest
+        {
+            int cx = 146, cy = 112;
+            fillrect(cx,    cy+10, 28, 20, RGBA32(100, 62, 18, 255));
+            fillrect(cx,    cy,    28, 12, RGBA32(130, 82, 28, 255));
+            fillrect(cx+2,  cy-1,  24,  2, RGBA32(155, 100, 40, 255));
+            fillrect(cx,    cy+10, 28,  2, RGBA32(215, 175,  0, 255));
+            fillrect(cx,    cy+28, 28,  2, RGBA32(215, 175,  0, 255));
+            fillrect(cx,    cy,    28,  2, RGBA32(215, 175,  0, 255));
+            fillrect(cx,    cy,     2, 30, RGBA32(215, 175,  0, 255));
+            fillrect(cx+26, cy,     2, 30, RGBA32(215, 175,  0, 255));
+            fillrect(cx+11, cy+8,   6,  6, RGBA32(215, 175,  0, 255));
+            fillrect(cx+13, cy+9,   2,  2, RGBA32(30,  20,   5, 255));
+            fillrect(cx+13, cy+11,  2,  3, RGBA32(30,  20,   5, 255));
+            int glow = ((f / 30) & 1) ? 60 : 20;
+            fillrect(cx+3,  cy+3,   8,  2, RGBA32(255, 230, 100, glow));
+            fillrect(cx+14, cy+3,   8,  2, RGBA32(255, 230, 100, glow));
+        }
+
+        // Attack slash trail
+        if (atk > 22) {
+            int prog = 42 - atk;
+            int swx_tip = sx + 14, swy_tip = sy - 14;
+            int tx = (G.attack_target == 0) ? ex + 1 : kx;
+            int ty = (G.attack_target == 0) ? ey + 4 : ky;
+            int lx = swx_tip + ((tx - swx_tip) * prog) / 19;
+            int ly = swy_tip + ((ty - swy_tip) * prog) / 19;
+            fillrect(lx-2, ly-2, 6, 6, RGBA32(255, 255, 120, 255));
+            fillrect(lx-1, ly-1, 4, 4, RGBA32(255, 240, 60,  255));
+            if (prog > 2) {
+                int lx2 = swx_tip + ((tx - swx_tip) * (prog - 3)) / 19;
+                int ly2 = swy_tip + ((ty - swy_tip) * (prog - 3)) / 19;
+                fillrect(lx2-1, ly2-1, 4, 4, RGBA32(220, 200, 40, 180));
+            }
+            if (prog > 5) {
+                int lx3 = swx_tip + ((tx - swx_tip) * (prog - 6)) / 19;
+                int ly3 = swy_tip + ((ty - swy_tip) * (prog - 6)) / 19;
+                fillrect(lx3,   ly3,   2, 2, RGBA32(180, 140, 20, 120));
+            }
+        } else if (atk > 0) {
+            int hx2 = (G.attack_target == 0) ? ex + 1 : kx;
+            int hy2 = (G.attack_target == 0) ? ey + 4 : ky;
+            int sp  = 22 - atk;
+            fillrect(hx2 + sp,     hy2 - sp/2, 3, 3, RGBA32(255, 230,   0, 255));
+            fillrect(hx2 - sp,     hy2 + sp/2, 3, 3, RGBA32(255, 200,  50, 255));
+            fillrect(hx2 + sp/2,   hy2 + sp,   3, 3, RGBA32(255, 160,   0, 255));
+            fillrect(hx2 - sp/2,   hy2 - sp,   3, 3, RGBA32(255, 100,   0, 255));
+            if (sp < 9)
+                fillrect(hx2 - 3, hy2 - 3, 7, 7, RGBA32(255, 255, 200, 255));
+        }
+    } // end ROOM_DUNGEON enemies
+
+    // ── Room exit indicators (arrows at edges) ─────────────────────────────
+    {
+        const RoomExits *ex = &ROOM_MAP[room];
+        color_t arrow_col = RGBA32(200, 180, 100, 180);
+        if (ex->east >= 0) {    // right arrow
+            fillrect(312, 72, 4, 8, arrow_col);
+            fillrect(308, 76, 4, 4, arrow_col);
+        }
+        if (ex->west >= 0) {    // left arrow
+            fillrect(4, 72, 4, 8, arrow_col);
+            fillrect(8, 76, 4, 4, arrow_col);
+        }
+        if (ex->north >= 0) {   // up arrow
+            fillrect(156, 16, 8, 4, arrow_col);
+            fillrect(160, 20, 4, 4, arrow_col);
+        }
+        if (ex->south >= 0) {   // down arrow
+            fillrect(156, 142, 8, 4, arrow_col);
+            fillrect(160, 138, 4, 4, arrow_col);
+        }
+    }
+
+    // ── HUD: 4 Hearts + Magic Bar + Room Name (drawn last = on top) ──────
     fillrect(0, 0, 320, 14, RGBA32(0, 0, 0, 255));   // dark HUD band
 
     // 4 heart containers — each 8×6 px, gap of 2px → 10px per heart
@@ -660,11 +1001,20 @@ static void scene_dungeon(void) {
         if (G.rpc_active) {
             // RPC bar (purple = remote inference)
             fillrect(130, bar_y, 84, 6, RGBA32(20, 20, 20, 255));
-            if (G.state == STATE_GENERATING) {
+            if (G.state == STATE_GENERATING && G.rpc_pending) {
                 // Pulsing bar while waiting for RPC response
                 int pulse = (G.frame / 4) % 60;
                 fillrect(132, bar_y+1, pulse + 20, 4, RGBA32(180, 80, 255, 255));
+            } else if (G.perf_gen_total_us > 0) {
+                // Solid bar showing latency quality after response
+                // 200ms = full (80px), 2000ms = minimum (8px)
+                int latency_ms = (int)(G.perf_gen_total_us / 1000);
+                int rpc_fill = 80 - (latency_ms - 200) / 25;
+                if (rpc_fill > 80) rpc_fill = 80;
+                if (rpc_fill < 8)  rpc_fill = 8;
+                fillrect(132, bar_y+1, rpc_fill, 4, RGBA32(140, 60, 220, 255));
             }
+            // Purple border
             fillrect(130, bar_y,   84, 1, RGBA32(140, 80, 180, 255));
             fillrect(130, bar_y+5, 84, 1, RGBA32(140, 80, 180, 255));
             fillrect(130, bar_y,    1, 6, RGBA32(140, 80, 180, 255));
@@ -693,9 +1043,6 @@ static void scene_dungeon(void) {
             // Will be drawn with graphics_draw_text in SW pass
         }
     }
-
-    // Floor line
-    fillrect(0, 148, 320, 2, RGBA32(40,30,60,255));
 }
 
 static void scene_dialog_box(void) {
@@ -705,6 +1052,174 @@ static void scene_dialog_box(void) {
     fillrect(8, 150,   2, 80, RGBA32(215,175,0,255));
     fillrect(310,150,  2, 80, RGBA32(215,175,0,255));
     fillrect(11, 153, 298, 1, RGBA32(100,80,20,255));
+}
+
+// ─── Dialog Selection Scene (D-pad option picker) ────────────────────────────
+
+static void scene_dialog_select(void) {
+    // Semi-transparent overlay box with 4 dialog options
+    fillrect(8, 150, 304, 80, RGBA32(0, 0, 50, 255));
+    fillrect(8, 150, 304, 2,  RGBA32(215,175,0,255));
+    fillrect(8, 228, 304, 2,  RGBA32(215,175,0,255));
+    fillrect(8, 150,   2, 80, RGBA32(215,175,0,255));
+    fillrect(310,150,  2, 80, RGBA32(215,175,0,255));
+    // Highlight selected option
+    int sel_y = 158 + G.dialog_select_idx * 16;
+    fillrect(12, sel_y, 296, 14, RGBA32(80, 60, 0, 255));
+    // Gold selector arrow
+    fillrect(14, sel_y + 3, 6, 2, RGBA32(215, 175, 0, 255));
+    fillrect(18, sel_y + 1, 2, 6, RGBA32(215, 175, 0, 255));
+}
+
+// ─── Room transition fade overlay ────────────────────────────────────────────
+
+static void scene_room_transition(void) {
+    // Simple fade to black and back: timer goes 20→0
+    int alpha = 0;
+    if (G.transition_timer > 10) {
+        // Fading out (20→11): alpha 0→255
+        alpha = (20 - G.transition_timer) * 255 / 10;
+    } else {
+        // Fading in (10→0): alpha 255→0
+        alpha = G.transition_timer * 255 / 10;
+    }
+    if (alpha > 255) alpha = 255;
+    if (alpha < 0)   alpha = 0;
+    // Full screen dark overlay
+    fillrect(0, 0, 320, 240, RGBA32(0, 0, 0, (uint8_t)alpha));
+}
+
+// ─── Virtual Keyboard ────────────────────────────────────────────────────────
+// 4 rows x 10 cols D-pad character picker for player text input to Sophia
+
+static const char KB_GRID[4][11] = {
+    "ABCDEFGHIJ",
+    "KLMNOPQRST",
+    "UVWXYZ .,?",
+    "0123456789",
+};
+
+static void scene_keyboard(void) {
+    /* Dark background */
+    fillrect(0, 0, 320, 240, RGBA32(10, 5, 20, 255));
+
+    /* Input display area (top) */
+    fillrect(8, 8, 304, 24, RGBA32(0, 0, 40, 255));
+    fillrect(8, 8, 304, 1, RGBA32(215,175,0,255));
+    fillrect(8, 31, 304, 1, RGBA32(215,175,0,255));
+    fillrect(8, 8, 1, 24, RGBA32(215,175,0,255));
+    fillrect(311, 8, 1, 24, RGBA32(215,175,0,255));
+
+    /* Keyboard grid background */
+    fillrect(20, 80, 280, 120, RGBA32(0, 0, 50, 255));
+
+    /* Highlight selected cell */
+    int cx = 28 + G.kb_col * 28;
+    int cy = 84 + G.kb_row * 28;
+    fillrect(cx, cy, 24, 24, RGBA32(180, 140, 0, 255));
+
+    /* Grid cell borders */
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 10; c++) {
+            int x = 28 + c * 28;
+            int y = 84 + r * 28;
+            fillrect(x, y, 24, 1, RGBA32(80, 60, 120, 255));
+            fillrect(x, y+23, 24, 1, RGBA32(80, 60, 120, 255));
+            fillrect(x, y, 1, 24, RGBA32(80, 60, 120, 255));
+            fillrect(x+23, y, 1, 24, RGBA32(80, 60, 120, 255));
+        }
+    }
+
+    /* Bottom bar */
+    fillrect(20, 210, 280, 1, RGBA32(100, 80, 20, 255));
+}
+
+static void draw_keyboard_text(surface_t *disp) {
+    graphics_draw_text(disp, 16, 2, "Ask Sophia:");
+
+    /* Show current input with cursor */
+    char ibuf[66];
+    int len = G.kb_len;
+    if (len > 60) len = 60;
+    memcpy(ibuf, G.kb_input, len);
+    ibuf[len] = '_';
+    ibuf[len + 1] = '\0';
+    graphics_draw_text(disp, 14, 14, ibuf);
+
+    /* Draw keyboard grid characters */
+    char cbuf[2] = {0, 0};
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 10; c++) {
+            cbuf[0] = KB_GRID[r][c];
+            int x = 36 + c * 28;
+            int y = 90 + r * 28;
+            graphics_draw_text(disp, x, y, cbuf);
+        }
+    }
+
+    /* Instructions */
+    graphics_draw_text(disp, 20, 216, "[A]Select [B]Delete [START]Send");
+    /* Show char count */
+    char cntbuf[8];
+    cntbuf[0] = '0' + (G.kb_len / 10) % 10;
+    cntbuf[1] = '0' + G.kb_len % 10;
+    cntbuf[2] = '/';
+    cntbuf[3] = '6';
+    cntbuf[4] = '0';
+    cntbuf[5] = '\0';
+    graphics_draw_text(disp, 270, 2, cntbuf);
+}
+
+static void handle_keyboard_input(struct controller_data *k) {
+    if (G.kb_debounce > 0) { G.kb_debounce--; return; }
+
+    /* D-pad navigation */
+    if (k->c[0].up)    { G.kb_row = (G.kb_row + 3) % 4; G.kb_debounce = 5; }
+    if (k->c[0].down)  { G.kb_row = (G.kb_row + 1) % 4; G.kb_debounce = 5; }
+    if (k->c[0].left)  { G.kb_col = (G.kb_col + 9) % 10; G.kb_debounce = 5; }
+    if (k->c[0].right) { G.kb_col = (G.kb_col + 1) % 10; G.kb_debounce = 5; }
+
+    /* A = select character */
+    if (k->c[0].A && G.kb_len < 60) {
+        char ch = KB_GRID[G.kb_row][G.kb_col];
+        /* Convert to lowercase for model input */
+        if (ch >= 'A' && ch <= 'Z') ch = ch + 32;
+        G.kb_input[G.kb_len++] = ch;
+        G.kb_debounce = 8;
+    }
+
+    /* B = backspace */
+    if (k->c[0].B && G.kb_len > 0) {
+        G.kb_len--;
+        G.kb_input[G.kb_len] = '\0';
+        G.kb_debounce = 8;
+    }
+
+    /* START = send to current NPC */
+    if (k->c[0].start && G.kb_len > 0) {
+        /* Build prompt string from keyboard input, add ": " suffix for model */
+        char prompt_str[66];
+        int plen = G.kb_len;
+        if (plen > 60) plen = 60;
+        memcpy(prompt_str, G.kb_input, plen);
+        prompt_str[plen++] = ':';
+        prompt_str[plen++] = ' ';
+        prompt_str[plen] = '\0';
+
+        int npc = G.current_npc;
+        if (npc < 0) npc = 0;
+        start_dialog_from_prompt(npc, prompt_str, 1);
+
+        /* Clear keyboard buffer for next time */
+        G.kb_len = 0;
+        memset(G.kb_input, 0, sizeof(G.kb_input));
+    }
+
+    /* Z = cancel, back to dungeon */
+    if (k->c[0].Z) {
+        G.state = STATE_DUNGEON;
+        G.kb_debounce = 10;
+    }
 }
 
 // ─── CPU text overlay ────────────────────────────────────────────────────────
@@ -738,13 +1253,62 @@ static void draw_text(surface_t *disp) {
         break;
 
     case STATE_DUNGEON:
+        // Room name in HUD (right of magic bar)
+        graphics_draw_text(disp, 60, 3, ROOM_NAMES[G.current_room]);
         graphics_draw_text(disp, 186, 3,  "MP");   // magic bar label
-        graphics_draw_text(disp,  10, 220, "[A] Talk to Sophia  (auto-attack)");
+        // Context-sensitive help text
+        if (G.current_room == ROOM_DUNGEON)
+            graphics_draw_text(disp,  10, 220, "[A]Talk [B]Keyboard  (auto-attack)");
+        else
+            graphics_draw_text(disp, 10, 220, "[A]Talk [B]Keyboard [L/R]Move");
+        break;
+
+    case STATE_DIALOG_SELECT: {
+        // Room name in HUD
+        graphics_draw_text(disp, 60, 3, ROOM_NAMES[G.current_room]);
+        graphics_draw_text(disp, 186, 3,  "MP");
+        // NPC name
+        if (G.current_npc >= 0)
+            graphics_draw_text(disp, 16, 154, NPC_PROFILES[G.current_npc].name);
+        else
+            graphics_draw_text(disp, 16, 154, "???");
+        // Dialog options
+        {
+            int npc = G.current_npc;
+            if (npc < 0) npc = 0;
+            for (int i = 0; i < DIALOG_OPTIONS; i++) {
+                const char *opt = NPC_DIALOG_OPTIONS[npc][i];
+                // Truncate display (remove trailing ": ")
+                char obuf[32];
+                int olen = 0;
+                for (int j = 0; opt[j] && opt[j] != ':' && olen < 30; j++)
+                    obuf[olen++] = opt[j];
+                obuf[olen] = '\0';
+                int oy = 162 + i * 16;
+                graphics_draw_text(disp, 26, oy, obuf);
+            }
+        }
+        graphics_draw_text(disp, 10, 230, "[A]Select [B]Cancel [D-pad]Choose");
+        break;
+    }
+
+    case STATE_ROOM_TRANSITION:
+        // Brief flash, no text needed
+        break;
+
+    case STATE_KEYBOARD:
+        draw_keyboard_text(disp);
         break;
 
     case STATE_DIALOG:
     case STATE_GENERATING: {
-        graphics_draw_text(disp, 16, 158, "Sophia Elya:");
+        // Room name in HUD
+        graphics_draw_text(disp, 60, 3, ROOM_NAMES[G.current_room]);
+        // NPC name instead of hardcoded "Sophia Elya:"
+        if (G.current_npc >= 0)
+            graphics_draw_text(disp, 16, 158, NPC_PROFILES[G.current_npc].name);
+        else
+            graphics_draw_text(disp, 16, 158, "Sophia Elya:");
 
         // Performance overlay during generation
         if (G.state == STATE_GENERATING && G.gen_out_count > 0) {
@@ -792,6 +1356,31 @@ static void draw_text(surface_t *disp) {
 #ifdef USE_RSP_MATMUL
             // RSP indicator (cyan)
             graphics_draw_text(disp, 44, bar_y - 1, "RSP");
+#endif
+#ifdef USE_RPC_LLM
+            if (G.rpc_active) {
+                // RPC label and latency display
+                graphics_draw_text(disp, 44, bar_y - 1, "RPC");
+                // Show RPC latency in ms when available
+                if (G.perf_gen_total_us > 0 && G.state == STATE_DIALOG) {
+                    char rpcbuf[12];
+                    int ms = (int)(G.perf_gen_total_us / 1000);
+                    int ri = 0;
+                    if (ms >= 1000) { rpcbuf[ri++] = '0' + (ms/1000)%10; }
+                    if (ms >= 100 || ri > 0) rpcbuf[ri++] = '0' + (ms/100)%10;
+                    rpcbuf[ri++] = '0' + (ms/10)%10;
+                    rpcbuf[ri++] = '0' + ms%10;
+                    rpcbuf[ri++] = 'm'; rpcbuf[ri++] = 's'; rpcbuf[ri] = '\0';
+                    graphics_draw_text(disp, 82, bar_y - 1, rpcbuf);
+                } else if (G.rpc_pending) {
+                    // Pulsing dots while waiting
+                    int dots = (G.frame / 10) % 4;
+                    char dotbuf[5] = "    ";
+                    for (int d = 0; d < dots; d++) dotbuf[d] = '.';
+                    dotbuf[dots] = '\0';
+                    graphics_draw_text(disp, 82, bar_y - 1, dotbuf);
+                }
+            }
 #endif
         }
 
@@ -976,7 +1565,16 @@ static void update_generating_step(void) {
 
 // ─── Dialog logic ─────────────────────────────────────────────────────────────
 
-static void start_dialog(void) {
+/* Open the dialog option selector (D-pad menu) */
+static void open_dialog_select(void) {
+    G.state = STATE_DIALOG_SELECT;
+    G.dialog_select_idx = 0;
+}
+
+/* Start AI generation from a specific prompt string.
+ * npc_idx: which NPC is speaking (for persona prefix + canned fallback).
+ * prompt: the chosen prompt string (from NPC_DIALOG_OPTIONS or keyboard). */
+static void start_dialog_from_prompt(int npc_idx, const char *prompt, int use_persona) {
     G.state       = STATE_GENERATING;
     G.dialog_char = 0;
     G.dialog_done = 0;
@@ -994,40 +1592,58 @@ static void start_dialog(void) {
     G.rpc_pending       = 0;
 #endif
     memset(G.dialog_buf, 0, sizeof(G.dialog_buf));
-
-    /* Hardware entropy seed selection — RIP-PoA oscillator trick:
-     * XOR CPU cycle counter low bits with frame + last token hash.
-     * Low bits of TICKS_READ() vary ~12 bits per A-press due to
-     * player reaction time jitter and music sample phase offset.
-     * This guarantees a different prompt is chosen nearly every time. */
-    uint32_t entropy = N64_ENTROPY();
-    int idx = (int)(entropy % N_PROMPTS);
-    G.prompt_idx++;   /* also increment for sequential tracking */
+    G.prompt_idx++;
 
     if (G.ai_ready) {
         sgai_reset(&G.ai);
-        const char *p = PROMPTS[idx];
-        int plen = (int)strlen(p);
-        /* Feed bare prompt — no seed prefix.
-         * Context=32 tokens; seeds were burning 13-14 tokens leaving <5 for
-         * response. Bare prompt (13-20 chars) leaves 12-19 response tokens. */
-        if (plen > (int)sizeof(G.gen_pbuf) - 1)
-            plen = (int)sizeof(G.gen_pbuf) - 1;
-        memcpy(G.gen_pbuf, p, plen);
+
+        /* Build prompt: optional persona prefix + actual prompt.
+         * Persona prefix steers the model's voice without burning too many tokens.
+         * E.g. "smith says: What is the G4?: " */
+        int plen = 0;
+        if (use_persona && npc_idx >= 0 && npc_idx < NPC_COUNT) {
+            const char *prefix = NPC_PROFILES[npc_idx].persona_prefix;
+            int pfx_len = (int)strlen(prefix);
+            if (pfx_len > 20) pfx_len = 20;  // cap prefix to preserve response room
+            memcpy(G.gen_pbuf, prefix, pfx_len);
+            plen = pfx_len;
+        }
+        int prlen = (int)strlen(prompt);
+        if (plen + prlen > (int)sizeof(G.gen_pbuf) - 1)
+            prlen = (int)sizeof(G.gen_pbuf) - 1 - plen;
+        memcpy(G.gen_pbuf + plen, prompt, prlen);
+        plen += prlen;
+
         G.gen_plen     = plen;
         G.gen_ppos     = 0;
         G.gen_last_tok = G.gen_pbuf[0];
     } else {
-        // Canned fallback: entropy-selected from N_CANNED pool
-        const char *resp = CANNED[idx % N_CANNED];
+        /* Canned fallback: use NPC-specific canned responses */
+        int opt_idx = G.dialog_select_idx;
+        if (opt_idx < 0 || opt_idx >= DIALOG_OPTIONS) opt_idx = 0;
+        int ni = npc_idx;
+        if (ni < 0 || ni >= NPC_COUNT) ni = 0;
+        const char *resp = NPC_CANNED[ni][opt_idx];
         strncpy((char *)G.dialog_buf, resp, sizeof(G.dialog_buf) - 1);
         G.dialog_len = (int)strlen(resp);
-        G.gen_plen   = 0;   // signals canned path in update_generating_step
+        G.gen_plen   = 0;
         G.gen_ppos   = 0;
     }
 }
 
+/* Legacy start_dialog: opens the D-pad option selector */
+static void start_dialog(void) {
+    open_dialog_select();
+}
+
 // ─── Input ────────────────────────────────────────────────────────────────────
+
+/* Begin room transition to target room */
+static void begin_room_transition(RoomID target) {
+    G.state = STATE_ROOM_TRANSITION;
+    G.transition_target = target;
+    G.transition_timer = 20;  // 20 frames total fade
+}
 
 static void handle_input(void) {
     controller_scan();
@@ -1041,6 +1657,48 @@ static void handle_input(void) {
         break;
     case STATE_DUNGEON:
         if (k.c[0].A) start_dialog();
+        if (k.c[0].B) {
+            G.state = STATE_KEYBOARD;
+            G.kb_row = 0; G.kb_col = 0;
+            G.kb_len = 0; G.kb_debounce = 10;
+            memset(G.kb_input, 0, sizeof(G.kb_input));
+        }
+        /* Room transitions via L/R shoulder buttons */
+        {
+            const RoomExits *ex = &ROOM_MAP[G.current_room];
+            if (k.c[0].L && ex->west >= 0)
+                begin_room_transition((RoomID)ex->west);
+            if (k.c[0].R && ex->east >= 0)
+                begin_room_transition((RoomID)ex->east);
+            /* D-pad left/right also transition rooms (natural movement) */
+            if (k.c[0].left && ex->west >= 0)
+                begin_room_transition((RoomID)ex->west);
+            if (k.c[0].right && ex->east >= 0)
+                begin_room_transition((RoomID)ex->east);
+        }
+        break;
+    case STATE_DIALOG_SELECT:
+        /* D-pad up/down to navigate options */
+        if (k.c[0].up)
+            G.dialog_select_idx = (G.dialog_select_idx + DIALOG_OPTIONS - 1) % DIALOG_OPTIONS;
+        if (k.c[0].down)
+            G.dialog_select_idx = (G.dialog_select_idx + 1) % DIALOG_OPTIONS;
+        /* A = confirm selection, start generation */
+        if (k.c[0].A) {
+            int npc = G.current_npc;
+            if (npc < 0) npc = 0;
+            const char *prompt = NPC_DIALOG_OPTIONS[npc][G.dialog_select_idx];
+            start_dialog_from_prompt(npc, prompt, 1);
+        }
+        /* B = cancel, return to exploration */
+        if (k.c[0].B)
+            G.state = STATE_DUNGEON;
+        break;
+    case STATE_ROOM_TRANSITION:
+        /* Non-interactive during transition */
+        break;
+    case STATE_KEYBOARD:
+        handle_keyboard_input(&k);
         break;
     case STATE_DIALOG:
         if (k.c[0].A) start_dialog();
@@ -1074,10 +1732,15 @@ static void game_init(void) {
 
     G.hearts = 8;    // 4 full hearts
     G.magic  = 128;  // full magic bar
+    G.current_room = ROOM_DUNGEON;
+    G.current_npc  = 0;  // Sophia
+    G.dialog_select_idx = 0;
+    G.player_x = 160;
+    G.player_y = 120;
 
     int fd = dfs_open("/sophia_weights.bin");
     if (fd >= 0) {
-        static uint8_t wbuf[1024 * 1024] __attribute__((aligned(8)));  /* 1MB for v5 Q8 4-layer */
+        static uint8_t wbuf[3 * 1024 * 1024] __attribute__((aligned(8)));  /* 3MB for v8 Q8 6-layer 192-embed */
         int sz = dfs_size(fd);
         if (sz > 0 && sz <= (int)sizeof(wbuf)) {
             dfs_read(wbuf, 1, sz, fd);
@@ -1115,6 +1778,23 @@ int main(void) {
                 G.state = STATE_TITLE;
         }
 
+        // Room transition logic
+        if (G.state == STATE_ROOM_TRANSITION) {
+            G.transition_timer--;
+            if (G.transition_timer == 10) {
+                // Midpoint: switch room
+                G.current_room = G.transition_target;
+                G.attack_timer = 0;  // reset combat on room change
+            }
+            if (G.transition_timer <= 0) {
+                G.state = STATE_DUNGEON;
+            }
+        }
+
+        // Update forge sparks
+        if (G.current_room == ROOM_FORGE)
+            update_sparks();
+
         // Per-frame AI generation step
         if (G.state == STATE_GENERATING)
             update_generating_step();
@@ -1132,10 +1812,16 @@ int main(void) {
             fillrect(0, 0, 320, 240, RGBA32(0, 0, 20, 255));
             fillrect(30,  30, 260, 6, RGBA32(180, 140, 0, 255));
             fillrect(30, 130, 260, 6, RGBA32(180, 140, 0, 255));
+        } else if (G.state == STATE_KEYBOARD) {
+            scene_keyboard();
         } else {
             scene_dungeon();
+            if (G.state == STATE_DIALOG_SELECT)
+                scene_dialog_select();
             if (G.state == STATE_DIALOG || G.state == STATE_GENERATING)
                 scene_dialog_box();
+            if (G.state == STATE_ROOM_TRANSITION)
+                scene_room_transition();
         }
 
         // Wait for RDP to finish before CPU text pass
