@@ -3,14 +3,14 @@
 #include <libdragon.h>
 
 // Sophia Elya AI - World's First N64 LLM
-// nano-GPT v8: 6 layers, 192 embedding, 6 heads, vocab=256, ctx=128
-// 2.7M parameters — requires 8MB Expansion Pak
+// nano-GPT v9 LARGE: 8 layers, 256 embedding, 8 heads, vocab=256, ctx=128
+// 8.4M parameters — requires 8MB Expansion Pak
 // RSP-accelerated matrix multiply via DMA tiling
 
 #define SGAI_MAGIC      0x53454149  // "SEAI"
-#define SGAI_N_LAYERS   6
-#define SGAI_N_EMBED    192
-#define SGAI_N_HEADS    6
+#define SGAI_N_LAYERS   8
+#define SGAI_N_EMBED    256
+#define SGAI_N_HEADS    8
 #define SGAI_HEAD_DIM   (SGAI_N_EMBED / SGAI_N_HEADS)  // 32
 #define SGAI_VOCAB      256
 #define SGAI_CTX        128

@@ -207,7 +207,7 @@ static int load_model(Model *model, const char *path)
         return -1;
     }
 
-    if (read_u32_le(model->blob) != 0x49414553u) {
+    if (read_u32_le(model->blob) != 0x53454149u && read_u32_le(model->blob) != 0x49414553u) {
         fprintf(stderr, "Unexpected weight magic in %s\n", path);
         return -1;
     }

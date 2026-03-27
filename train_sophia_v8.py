@@ -36,9 +36,11 @@ if hasattr(torch, "set_float32_matmul_precision"):
 print(f"Device: {device}")
 
 # Must match nano_gpt.h exactly.
-N_LAYERS = 6
-N_EMBED = 192
-N_HEADS = 6
+# Large config — requires Expansion Pak (8MB RDRAM)
+# ~8.4M params, 4.2MB weights, 1.6MB KV cache = ~6MB total
+N_LAYERS = 8
+N_EMBED = 256
+N_HEADS = 8
 VOCAB = 256
 CTX = 128
 Q_BLOCK = 32
